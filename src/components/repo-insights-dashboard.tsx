@@ -10,6 +10,7 @@ import {
   GitBranch,
   GitCommitHorizontal,
   GitFork,
+  GitPullRequest,
   Scale,
   Star,
   Users,
@@ -55,6 +56,28 @@ function formatShortDate(value: string) {
     month: "short",
     day: "numeric",
   }).format(new Date(value));
+}
+
+// This helper keeps time-to-merge readable in the collaboration panel.
+function formatHours(value: number | null) {
+  if (value === null) {
+    return "Not enough data";
+  }
+
+  if (value < 24) {
+    return `${value}h`;
+  }
+
+  return `${(value / 24).toFixed(1)}d`;
+}
+
+// This helper formats rate-style values for heuristics that compare recent issue intake versus resolution.
+function formatPercent(value: number | null) {
+  if (value === null) {
+    return "Not enough data";
+  }
+
+  return `${Math.round(value * 100)}%`;
 }
 
 // This generic section wrapper makes the dashboard easier to scan and keeps the visual language consistent.
@@ -155,10 +178,10 @@ export function RepoInsightsDashboard() {
               Internship-ready GitHub analytics project
             </div>
             <h1 className="max-w-3xl text-4xl font-semibold tracking-tight text-slate-950 sm:text-5xl">
-              Understand a repository’s engineering story in one polished report.
+              Understand a repository&apos;s engineering story in one polished report.
             </h1>
             <p className="mt-4 max-w-2xl text-base leading-7 text-slate-600 sm:text-lg">
-              Paste a public GitHub repository and turn raw activity data into a clear dashboard of momentum, composition, contributors, and health signals.
+              Paste a public GitHub repository and turn raw activity data into a clear dashboard of momentum, composition, contributors, delivery flow, and health signals.
             </p>
           </div>
 
@@ -219,7 +242,7 @@ export function RepoInsightsDashboard() {
 
       {data ? (
         <div className="mt-6 space-y-6">
-          <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+          <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-6">
             <MetricCard
               label="Stars"
               value={formatCompactNumber(data.repo.stars)}
@@ -239,6 +262,11 @@ export function RepoInsightsDashboard() {
               label="Open Issues"
               value={formatCompactNumber(data.repo.openIssues)}
               icon={<AlertCircle className="h-5 w-5" />}
+            />
+            <MetricCard
+              label="Open PRs"
+              value={formatCompactNumber(data.collaboration.openPullRequests)}
+              icon={<GitPullRequest className="h-5 w-5" />}
             />
             <MetricCard
               label="Active Contributors"
@@ -320,7 +348,7 @@ export function RepoInsightsDashboard() {
 
             <SectionCard
               title="Health Heuristic"
-              subtitle="A lightweight interview-friendly score built from activity, contributors, and maintenance signals."
+              subtitle="A lightweight interview-friendly score built from activity, contributor breadth, and delivery signals."
             >
               <div className="space-y-4">
                 <div className="flex items-center gap-3 rounded-3xl bg-[var(--accent-soft)] px-4 py-4 text-slate-900">
@@ -423,6 +451,126 @@ export function RepoInsightsDashboard() {
             </SectionCard>
           </section>
 
+          <section className="grid gap-6 xl:grid-cols-[0.95fr_1.05fr]">
+            <SectionCard
+              title="Issue and PR Flow"
+              subtitle="This layer shows whether the repo is actively discussing, reviewing, and shipping work."
+            >
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="rounded-3xl border border-slate-200 bg-white px-5 py-4">
+                  <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Open Work</p>
+                  <p className="mt-2 text-xl font-semibold text-slate-900">
+                    {formatCompactNumber(data.collaboration.openIssues)} issues
+                  </p>
+                  <p className="mt-2 text-sm text-muted">
+                    {formatCompactNumber(data.collaboration.openPullRequests)} open pull requests
+                  </p>
+                </div>
+                <div className="rounded-3xl border border-slate-200 bg-white px-5 py-4">
+                  <p className="text-xs uppercase tracking-[0.22em] text-slate-500">30-Day Collaboration</p>
+                  <p className="mt-2 text-xl font-semibold text-slate-900">
+                    {formatCompactNumber(data.derived.issuePullRequestVelocity)} tracked updates
+                  </p>
+                  <p className="mt-2 text-sm text-muted">
+                    {data.collaboration.issuesUpdatedLast30Days} issue updates, {data.collaboration.pullRequestsUpdatedLast30Days} PR updates
+                  </p>
+                </div>
+                <div className="rounded-3xl border border-slate-200 bg-white px-5 py-4">
+                  <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Recent Merges</p>
+                  <p className="mt-2 text-xl font-semibold text-slate-900">
+                    {formatCompactNumber(data.collaboration.mergedPullRequestsLast30Days)} merged in 30d
+                  </p>
+                  <p className="mt-2 text-sm text-muted">
+                    Avg merge time: {formatHours(data.collaboration.averagePullRequestMergeHours)}
+                  </p>
+                </div>
+                <div className="rounded-3xl border border-slate-200 bg-white px-5 py-4">
+                  <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Issue Resolution Rate</p>
+                  <p className="mt-2 text-xl font-semibold text-slate-900">
+                    {formatPercent(data.collaboration.issueResolutionRate)}
+                  </p>
+                  <p className="mt-2 text-sm text-muted">
+                    Based on recently opened versus recently closed issues in the sampled window
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-5">
+                <p className="mb-3 text-sm font-medium text-slate-900">Top recent labels</p>
+                <div className="flex flex-wrap gap-2">
+                  {data.collaboration.topLabels.length ? (
+                    data.collaboration.topLabels.map((label) => (
+                      <span
+                        key={label.name}
+                        className="rounded-full border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700"
+                      >
+                        {label.name} · {label.count}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="text-sm text-muted">No recent labels surfaced in the sampled issues.</span>
+                  )}
+                </div>
+              </div>
+            </SectionCard>
+
+            <SectionCard
+              title="Recent Discussions"
+              subtitle="This feed highlights the work items a recruiter or reviewer would likely inspect next."
+            >
+              <div className="grid gap-4 md:grid-cols-2">
+                <div>
+                  <p className="mb-3 flex items-center gap-2 text-sm font-medium text-slate-900">
+                    <AlertCircle className="h-4 w-4 text-[var(--accent)]" />
+                    Recent issues
+                  </p>
+                  <div className="space-y-3">
+                    {data.collaboration.recentIssues.map((issue) => (
+                      <a
+                        key={issue.number}
+                        href={issue.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="block rounded-3xl border border-slate-200 bg-white px-4 py-4 transition hover:border-slate-300 hover:bg-slate-50"
+                      >
+                        <p className="text-sm font-medium text-slate-900">
+                          #{issue.number} {issue.title}
+                        </p>
+                        <p className="mt-2 text-sm text-muted">
+                          {issue.author} • {issue.state} • updated {formatShortDate(issue.updatedAt)}
+                        </p>
+                      </a>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <p className="mb-3 flex items-center gap-2 text-sm font-medium text-slate-900">
+                    <GitPullRequest className="h-4 w-4 text-[var(--accent)]" />
+                    Recent pull requests
+                  </p>
+                  <div className="space-y-3">
+                    {data.collaboration.recentPullRequests.map((pullRequest) => (
+                      <a
+                        key={pullRequest.number}
+                        href={pullRequest.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="block rounded-3xl border border-slate-200 bg-white px-4 py-4 transition hover:border-slate-300 hover:bg-slate-50"
+                      >
+                        <p className="text-sm font-medium text-slate-900">
+                          #{pullRequest.number} {pullRequest.title}
+                        </p>
+                        <p className="mt-2 text-sm text-muted">
+                          {pullRequest.author} • {pullRequest.mergedAt ? "merged" : pullRequest.state} • updated {formatShortDate(pullRequest.updatedAt)}
+                        </p>
+                      </a>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </SectionCard>
+          </section>
+
           <section className="grid gap-6 lg:grid-cols-2">
             <SectionCard
               title="Top Contributors"
@@ -496,10 +644,10 @@ export function RepoInsightsDashboard() {
             <div className="glass-card rounded-[24px] p-5">
               <div className="mb-3 flex items-center gap-3">
                 <Flame className="h-5 w-5 text-[var(--accent)]" />
-                <h3 className="text-base font-semibold text-slate-900">MVP architecture choice</h3>
+                <h3 className="text-base font-semibold text-slate-900">Pre-deployment improvement</h3>
               </div>
               <p className="text-sm leading-6 text-muted">
-                The app uses a Next.js route handler as a backend-for-frontend so GitHub tokens, validation, and transformations stay server-side.
+                The app now measures work intake and review flow, so the dashboard speaks to engineering process rather than only repository popularity.
               </p>
             </div>
             <div className="glass-card rounded-[24px] p-5">
@@ -508,7 +656,7 @@ export function RepoInsightsDashboard() {
                 <h3 className="text-base font-semibold text-slate-900">Future-ready extension path</h3>
               </div>
               <p className="text-sm leading-6 text-muted">
-                You can add authenticated rate-limit upgrades, repo comparison, or cached historical reports later without reworking the UI contract.
+                You can add authenticated rate-limit upgrades, repo comparison, cached reports, or deployments later without reworking the core API contract.
               </p>
             </div>
           </section>

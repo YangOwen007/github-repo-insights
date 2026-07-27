@@ -23,6 +23,7 @@ It supports:
 - recent weekly commit activity chart
 - top contributor summaries
 - recent public activity feed
+- issue and pull request flow analysis
 - lightweight repo health heuristic
 - loading, error, and rate-limit states
 - responsive recruiter-friendly UI
@@ -61,6 +62,8 @@ The dashboard currently combines:
 - contributors
 - recent commits
 - recent public repository events
+- recent issues
+- recent pull requests
 
 ## Local Setup
 
@@ -80,6 +83,33 @@ GITHUB_TOKEN=your_personal_access_token
 ```
 
 For the MVP, a fine-grained token is not required if you only analyze public repositories occasionally, but it is helpful during repeated demos and development.
+
+## Deployment Notes
+
+This app is a good fit for Vercel because it is a standard Next.js application with server-side route handlers.
+
+Recommended production setup:
+
+1. Import the GitHub repository into Vercel.
+2. Add `GITHUB_TOKEN` in the Vercel project environment variables.
+3. Keep the app public and use the token only for server-side GitHub API requests.
+4. Redeploy after environment variables are added.
+
+Why add the token before shipping:
+
+- public unauthenticated GitHub API limits are easy to hit during recruiter demos
+- authenticated server-side requests make the deployed app much more reliable
+- the frontend does not need to change because the token is already read on the server
+
+## Pre-Deployment Checklist
+
+- `pnpm typecheck`
+- `pnpm lint`
+- `pnpm build`
+- set `GITHUB_TOKEN` for production
+- verify a few demo repositories still load correctly
+- add screenshots or a short demo GIF for the GitHub README
+- add the deployed URL to this README once live
 
 ## Verification
 
@@ -103,7 +133,6 @@ pnpm build
 Strong follow-up features after the MVP:
 
 - compare two repositories side by side
-- add issue and pull request analysis
 - save recent searches locally
 - export a markdown summary report
 - add caching for repeat lookups

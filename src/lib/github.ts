@@ -2,6 +2,8 @@ import {
   githubCommitSchema,
   githubContributorSchema,
   githubEventSchema,
+  githubIssueSchema,
+  githubPullRequestSchema,
   githubRepoSchema,
   repoQuerySchema,
   type RepoInsightResponse,
@@ -12,6 +14,7 @@ const GITHUB_API_BASE = "https://api.github.com";
 type GitHubHeaders = {
   remaining: number | null;
   resetAt: string | null;
+  link: string | null;
 };
 
 // This helper normalizes either "owner/repo" input or a pasted GitHub URL into one canonical format.
@@ -70,6 +73,7 @@ async function fetchGitHubJson<T>(
     resetAt: response.headers.get("x-ratelimit-reset")
       ? new Date(Number(response.headers.get("x-ratelimit-reset")) * 1000).toISOString()
       : null,
+    link: response.headers.get("link"),
   };
 
   if (response.status === 404) {
@@ -88,6 +92,27 @@ async function fetchGitHubJson<T>(
     data: (await response.json()) as T,
     headers,
   };
+}
+
+// This helper reads GitHub pagination metadata so we can estimate counts without downloading every page.
+function getPaginatedCount(linkHeader: string | null, fallbackCount: number) {
+  if (!linkHeader) {
+    return fallbackCount;
+  }
+
+  const lastMatch = linkHeader.match(/[?&]page=(\d+)>; rel="last"/);
+
+  if (lastMatch) {
+    return Number(lastMatch[1]);
+  }
+
+  const nextMatch = linkHeader.match(/[?&]page=(\d+)>; rel="next"/);
+
+  if (nextMatch) {
+    return Number(nextMatch[1]);
+  }
+
+  return fallbackCount;
 }
 
 // This helper converts GitHub's language byte map into sorted chart-ready percentages.
@@ -166,6 +191,9 @@ function buildHealthSummary(input: {
   commitsLast90Days: number;
   contributorCount: number;
   openIssues: number;
+  openPullRequests: number;
+  mergedPullRequestsLast30Days: number;
+  issueResolutionRate: number | null;
   stars: number;
 }) {
   const reasons: string[] = [];
@@ -208,6 +236,29 @@ function buildHealthSummary(input: {
     reasons.push("A large open issue backlog can be a maintenance warning sign.");
   }
 
+  if (input.mergedPullRequestsLast30Days >= 10) {
+    score += 10;
+    reasons.push("Recent pull request merges suggest maintainers are actively shipping changes.");
+  } else if (input.mergedPullRequestsLast30Days === 0) {
+    score -= 6;
+    reasons.push("No recent merged pull requests can indicate slower review and delivery loops.");
+  }
+
+  if (input.issueResolutionRate !== null) {
+    if (input.issueResolutionRate >= 0.6) {
+      score += 8;
+      reasons.push("Recent issue resolution looks healthy relative to newly observed issues.");
+    } else if (input.issueResolutionRate < 0.25) {
+      score -= 5;
+      reasons.push("Issues appear to be closing slower than they are opening in the recent sample.");
+    }
+  }
+
+  if (input.openPullRequests >= 50) {
+    score -= 4;
+    reasons.push("A large open pull request queue may signal review bottlenecks.");
+  }
+
   if (input.stars >= 500) {
     score += 7;
     reasons.push("Strong community interest can be a positive trust signal.");
@@ -247,26 +298,101 @@ function getLongestWeeklyStreak(commitActivity: RepoInsightResponse["commitActiv
   return longest;
 }
 
+// This helper lets us compare issue and PR activity as one simple recent collaboration velocity signal.
+function getIssuePullRequestVelocity(issuesUpdatedLast30Days: number, pullRequestsUpdatedLast30Days: number) {
+  return issuesUpdatedLast30Days + pullRequestsUpdatedLast30Days;
+}
+
+// This helper summarizes the labels that show up most often in the recent issue sample.
+function buildTopLabels(issues: Array<{ labels: Array<{ name: string }> }>) {
+  const counts = new Map<string, number>();
+
+  for (const issue of issues) {
+    for (const label of issue.labels) {
+      counts.set(label.name, (counts.get(label.name) ?? 0) + 1);
+    }
+  }
+
+  return Array.from(counts.entries())
+    .map(([name, count]) => ({ name, count }))
+    .sort((left, right) => right.count - left.count)
+    .slice(0, 5);
+}
+
+// This helper computes how quickly recently merged pull requests moved from open to merged.
+function getAverageMergeHours(pullRequests: Array<{ created_at: string; merged_at: string | null }>) {
+  const mergedDurations = pullRequests
+    .filter((pullRequest) => pullRequest.merged_at)
+    .map((pullRequest) => {
+      return (
+        new Date(pullRequest.merged_at as string).getTime() -
+        new Date(pullRequest.created_at).getTime()
+      ) / (1000 * 60 * 60);
+    });
+
+  if (!mergedDurations.length) {
+    return null;
+  }
+
+  return Number(
+    (
+      mergedDurations.reduce((sum, hours) => sum + hours, 0) / mergedDurations.length
+    ).toFixed(1),
+  );
+}
+
+// This helper compares recently opened and recently closed issues so the health heuristic can reason about throughput.
+function getIssueResolutionRate(issues: Array<{ created_at: string; closed_at: string | null }>) {
+  const now = Date.now();
+  const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+  const recentlyOpened = issues.filter((issue) => now - new Date(issue.created_at).getTime() <= thirtyDaysMs).length;
+  const recentlyClosed = issues.filter(
+    (issue) => issue.closed_at && now - new Date(issue.closed_at).getTime() <= thirtyDaysMs,
+  ).length;
+
+  if (!recentlyOpened) {
+    return recentlyClosed ? 1 : null;
+  }
+
+  return Number((recentlyClosed / recentlyOpened).toFixed(2));
+}
+
 // This main function fetches public GitHub data, validates it, and transforms it into dashboard-ready insight objects.
 export async function getRepoInsights(rawRepo: string): Promise<RepoInsightResponse> {
   const normalized = normalizeRepoInput(rawRepo);
 
-  const [repoResult, languageResult, contributorResult, commitResult, eventResult] =
+  const [repoResult, languageResult, contributorResult, commitResult, eventResult, issueResult, pullRequestResult, openPullRequestCountResult] =
     await Promise.all([
       fetchGitHubJson(`/repos/${normalized.owner}/${normalized.repo}`),
       fetchGitHubJson<Record<string, number>>(`/repos/${normalized.owner}/${normalized.repo}/languages`),
       fetchGitHubJson(`/repos/${normalized.owner}/${normalized.repo}/contributors?per_page=5`),
       fetchGitHubJson(`/repos/${normalized.owner}/${normalized.repo}/commits?per_page=100`),
       fetchGitHubJson(`/repos/${normalized.owner}/${normalized.repo}/events?per_page=12`),
+      fetchGitHubJson(
+        `/repos/${normalized.owner}/${normalized.repo}/issues?state=all&sort=updated&direction=desc&per_page=30`,
+      ),
+      fetchGitHubJson(
+        `/repos/${normalized.owner}/${normalized.repo}/pulls?state=all&sort=updated&direction=desc&per_page=30`,
+      ),
+      fetchGitHubJson(
+        `/repos/${normalized.owner}/${normalized.repo}/pulls?state=open&per_page=1`,
+      ),
     ]);
 
   const repo = githubRepoSchema.parse(repoResult.data);
   const contributors = githubContributorSchema.array().parse(contributorResult.data);
   const commits = githubCommitSchema.array().parse(commitResult.data);
   const events = githubEventSchema.array().parse(eventResult.data);
+  const issues = githubIssueSchema.array().parse(issueResult.data).filter((issue) => !issue.pull_request);
+  const pullRequests = githubPullRequestSchema.array().parse(pullRequestResult.data);
 
   const languageBreakdown = buildLanguageBreakdown(languageResult.data);
   const commitActivity = buildCommitActivity(commits);
+  const openPullRequests = getPaginatedCount(
+    openPullRequestCountResult.headers.link,
+    pullRequests.length ? 1 : 0,
+  );
+  const openIssues = Math.max(0, repo.open_issues_count - openPullRequests);
   const commitsLast30Days = commits.filter((item) => {
     return Date.now() - new Date(item.commit.author.date).getTime() <= 30 * 24 * 60 * 60 * 1000;
   }).length;
@@ -280,12 +406,29 @@ export async function getRepoInsights(rawRepo: string): Promise<RepoInsightRespo
         ).toFixed(1),
       )
     : 0;
+  const issuesUpdatedLast30Days = issues.filter((issue) => {
+    return Date.now() - new Date(issue.updated_at).getTime() <= 30 * 24 * 60 * 60 * 1000;
+  }).length;
+  const pullRequestsUpdatedLast30Days = pullRequests.filter((pullRequest) => {
+    return Date.now() - new Date(pullRequest.updated_at).getTime() <= 30 * 24 * 60 * 60 * 1000;
+  }).length;
+  const mergedPullRequestsLast30Days = pullRequests.filter((pullRequest) => {
+    return (
+      pullRequest.merged_at &&
+      Date.now() - new Date(pullRequest.merged_at).getTime() <= 30 * 24 * 60 * 60 * 1000
+    );
+  }).length;
+  const averagePullRequestMergeHours = getAverageMergeHours(pullRequests);
+  const issueResolutionRate = getIssueResolutionRate(issues);
 
   const health = buildHealthSummary({
     archived: repo.archived,
     commitsLast90Days,
     contributorCount: contributors.length,
-    openIssues: repo.open_issues_count,
+    openIssues,
+    openPullRequests,
+    mergedPullRequestsLast30Days,
+    issueResolutionRate,
     stars: repo.stargazers_count,
   });
 
@@ -303,7 +446,7 @@ export async function getRepoInsights(rawRepo: string): Promise<RepoInsightRespo
       stars: repo.stargazers_count,
       forks: repo.forks_count,
       watchers: repo.subscribers_count ?? repo.watchers_count,
-      openIssues: repo.open_issues_count,
+      openIssues,
       primaryLanguage: repo.language,
       defaultBranch: repo.default_branch,
       archived: repo.archived,
@@ -328,6 +471,33 @@ export async function getRepoInsights(rawRepo: string): Promise<RepoInsightRespo
       createdAt: event.created_at,
       summary: summarizeEvent(event),
     })),
+    collaboration: {
+      openIssues,
+      openPullRequests,
+      issuesUpdatedLast30Days,
+      pullRequestsUpdatedLast30Days,
+      mergedPullRequestsLast30Days,
+      averagePullRequestMergeHours,
+      issueResolutionRate,
+      topLabels: buildTopLabels(issues),
+      recentIssues: issues.slice(0, 5).map((issue) => ({
+        number: issue.number,
+        title: issue.title,
+        url: issue.html_url,
+        state: issue.state,
+        updatedAt: issue.updated_at,
+        author: issue.user.login,
+      })),
+      recentPullRequests: pullRequests.slice(0, 5).map((pullRequest) => ({
+        number: pullRequest.number,
+        title: pullRequest.title,
+        url: pullRequest.html_url,
+        state: pullRequest.state,
+        updatedAt: pullRequest.updated_at,
+        author: pullRequest.user.login,
+        mergedAt: pullRequest.merged_at,
+      })),
+    },
     health,
     derived: {
       commitsLast30Days,
@@ -335,6 +505,10 @@ export async function getRepoInsights(rawRepo: string): Promise<RepoInsightRespo
       contributorCount: contributors.length,
       averageCommitsPerWeek,
       longestWeeklyStreak: getLongestWeeklyStreak(commitActivity),
+      issuePullRequestVelocity: getIssuePullRequestVelocity(
+        issuesUpdatedLast30Days,
+        pullRequestsUpdatedLast30Days,
+      ),
     },
     rateLimit: repoResult.headers,
   };

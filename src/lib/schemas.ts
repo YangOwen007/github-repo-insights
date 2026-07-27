@@ -77,6 +77,55 @@ export const githubEventSchema = z.object({
   payload: z.record(z.string(), z.unknown()).optional().default({}),
 });
 
+// These schemas validate recent issue and pull request records that feed the pre-deployment analytics views.
+export const githubIssueSchema = z.object({
+  id: z.number(),
+  number: z.number(),
+  title: z.string(),
+  html_url: z.string().url(),
+  state: z.string(),
+  created_at: z.string(),
+  updated_at: z.string(),
+  closed_at: z.string().nullable(),
+  comments: z.number(),
+  user: z.object({
+    login: z.string(),
+  }),
+  labels: z.array(
+    z.object({
+      id: z.number(),
+      name: z.string(),
+      color: z.string(),
+    }),
+  ),
+  pull_request: z
+    .object({
+      url: z.string().url(),
+    })
+    .optional(),
+});
+
+export const githubPullRequestSchema = z.object({
+  id: z.number(),
+  number: z.number(),
+  title: z.string(),
+  html_url: z.string().url(),
+  state: z.string(),
+  created_at: z.string(),
+  updated_at: z.string(),
+  closed_at: z.string().nullable(),
+  merged_at: z.string().nullable(),
+  comments: z.number(),
+  review_comments: z.number(),
+  commits: z.number(),
+  additions: z.number().optional(),
+  deletions: z.number().optional(),
+  changed_files: z.number().optional(),
+  user: z.object({
+    login: z.string(),
+  }),
+});
+
 // These schemas describe the app's own API contract so the frontend and backend stay aligned.
 export const repoInsightResponseSchema = z.object({
   repo: z.object({
@@ -132,6 +181,42 @@ export const repoInsightResponseSchema = z.object({
       summary: z.string(),
     }),
   ),
+  collaboration: z.object({
+    openIssues: z.number(),
+    openPullRequests: z.number(),
+    issuesUpdatedLast30Days: z.number(),
+    pullRequestsUpdatedLast30Days: z.number(),
+    mergedPullRequestsLast30Days: z.number(),
+    averagePullRequestMergeHours: z.number().nullable(),
+    issueResolutionRate: z.number().nullable(),
+    topLabels: z.array(
+      z.object({
+        name: z.string(),
+        count: z.number(),
+      }),
+    ),
+    recentIssues: z.array(
+      z.object({
+        number: z.number(),
+        title: z.string(),
+        url: z.string().url(),
+        state: z.string(),
+        updatedAt: z.string(),
+        author: z.string(),
+      }),
+    ),
+    recentPullRequests: z.array(
+      z.object({
+        number: z.number(),
+        title: z.string(),
+        url: z.string().url(),
+        state: z.string(),
+        updatedAt: z.string(),
+        author: z.string(),
+        mergedAt: z.string().nullable(),
+      }),
+    ),
+  }),
   health: z.object({
     score: z.number(),
     label: z.string(),
@@ -143,6 +228,7 @@ export const repoInsightResponseSchema = z.object({
     contributorCount: z.number(),
     averageCommitsPerWeek: z.number(),
     longestWeeklyStreak: z.number(),
+    issuePullRequestVelocity: z.number(),
   }),
   rateLimit: z.object({
     remaining: z.number().nullable(),
