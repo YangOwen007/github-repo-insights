@@ -1,7 +1,7 @@
 "use client";
 
 import Image from "next/image";
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import {
   Activity,
   AlertCircle,
@@ -48,6 +48,7 @@ function formatFullDate(value: string | null) {
   return new Intl.DateTimeFormat("en", {
     dateStyle: "medium",
     timeStyle: "short",
+    timeZone: "UTC",
   }).format(new Date(value));
 }
 
@@ -55,6 +56,7 @@ function formatShortDate(value: string) {
   return new Intl.DateTimeFormat("en", {
     month: "short",
     day: "numeric",
+    timeZone: "UTC",
   }).format(new Date(value));
 }
 
@@ -77,7 +79,7 @@ function formatPercent(value: number | null) {
     return "Not enough data";
   }
 
-  return `${Math.round(value * 100)}%`;
+  return `${value.toFixed(2)} closed/opened`;
 }
 
 // This generic section wrapper makes the dashboard easier to scan and keeps the visual language consistent.
@@ -130,27 +132,36 @@ export function RepoInsightsDashboard() {
   const [data, setData] = useState<RepoInsightResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const activeRequest = useRef<AbortController | null>(null);
 
   useEffect(() => {
     void fetchInsights(DEFAULT_REPO);
+    return () => activeRequest.current?.abort();
   }, []);
 
   async function fetchInsights(repo: string) {
+    // Cancel older requests so they cannot overwrite a newer search or unmounted UI.
+    activeRequest.current?.abort();
+    const controller = new AbortController();
+    activeRequest.current = controller;
     setIsLoading(true);
     setError(null);
+    setData(null);
 
     try {
-      const response = await fetch(`/api/insights?repo=${encodeURIComponent(repo)}`);
+      const response = await fetch(`/api/insights?repo=${encodeURIComponent(repo)}`, { signal: controller.signal });
       const body = await response.json();
 
       if (!response.ok) {
         throw new Error(body.error ?? "Unable to load repository insights.");
       }
 
-      const parsed = repoInsightResponseSchema.parse(body);
-      setData(parsed);
-      setRepoInput(repo);
+      const parsed = repoInsightResponseSchema.safeParse(body);
+      if (!parsed.success) throw new Error("The report could not be read. Please try again.");
+      setData(parsed.data);
+      setRepoInput(parsed.data.repo.fullName);
     } catch (fetchError) {
+      if (controller.signal.aborted) return;
       setError(
         fetchError instanceof Error
           ? fetchError.message
@@ -158,7 +169,7 @@ export function RepoInsightsDashboard() {
       );
       setData(null);
     } finally {
-      setIsLoading(false);
+      if (!controller.signal.aborted) setIsLoading(false);
     }
   }
 
@@ -168,20 +179,20 @@ export function RepoInsightsDashboard() {
   }
 
   return (
-    <main className="mx-auto min-h-screen max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+    <main aria-busy={isLoading} className="mx-auto min-h-screen max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
       <section className="glass-card-strong relative overflow-hidden rounded-[36px] px-6 py-8 sm:px-10 sm:py-10">
         <div className="absolute inset-y-0 right-0 hidden w-1/2 bg-[radial-gradient(circle_at_center,rgba(15,118,110,0.15),transparent_62%)] lg:block" />
         <div className="relative grid gap-10 lg:grid-cols-[1.25fr_0.75fr] lg:items-end">
           <div>
             <div className="mb-5 inline-flex items-center gap-2 rounded-full border border-white/60 bg-white/70 px-4 py-2 text-sm text-slate-700">
               <GitBranch className="h-4 w-4" />
-              Internship-ready GitHub analytics project
+              GitHub Repo Insights
             </div>
             <h1 className="max-w-3xl text-4xl font-semibold tracking-tight text-slate-950 sm:text-5xl">
-              Understand a repository&apos;s engineering story in one polished report.
+              Explore a repository&apos;s activity and composition.
             </h1>
             <p className="mt-4 max-w-2xl text-base leading-7 text-slate-600 sm:text-lg">
-              Paste a public GitHub repository and turn raw activity data into a clear dashboard of momentum, composition, contributors, delivery flow, and health signals.
+              Paste a public GitHub repository to explore commits, languages, contributors, issues, and pull requests.
             </p>
           </div>
 
@@ -197,6 +208,9 @@ export function RepoInsightsDashboard() {
             <div className="flex flex-col gap-3">
               <input
                 id="repo-input"
+                required
+                maxLength={300}
+                aria-describedby="repo-help"
                 value={repoInput}
                 onChange={(event) => setRepoInput(event.target.value)}
                 placeholder="owner/repo or https://github.com/owner/repo"
@@ -210,7 +224,7 @@ export function RepoInsightsDashboard() {
                 {isLoading ? "Analyzing repository..." : "Generate insights"}
               </button>
             </div>
-            <p className="mt-3 text-xs text-muted">
+            <p id="repo-help" className="mt-3 text-xs text-muted">
               Recommended demo repos: <span className="font-medium text-slate-700">vercel/next.js</span>,{" "}
               <span className="font-medium text-slate-700">facebook/react</span>,{" "}
               <span className="font-medium text-slate-700">microsoft/vscode</span>
@@ -220,7 +234,7 @@ export function RepoInsightsDashboard() {
       </section>
 
       {error ? (
-        <div className="mt-6 flex items-start gap-3 rounded-[24px] border border-red-200 bg-red-50 px-5 py-4 text-red-900">
+        <div role="alert" className="mt-6 flex items-start gap-3 rounded-[24px] border border-red-200 bg-red-50 px-5 py-4 text-red-900">
           <AlertCircle className="mt-0.5 h-5 w-5 flex-none" />
           <div>
             <p className="font-medium">We couldn&apos;t analyze that repository.</p>
@@ -230,7 +244,8 @@ export function RepoInsightsDashboard() {
       ) : null}
 
       {!data && isLoading ? (
-        <div className="mt-6 grid gap-6 lg:grid-cols-2">
+        <div role="status" className="mt-6 grid gap-6 lg:grid-cols-2">
+          <p className="sr-only">Loading repository report.</p>
           {Array.from({ length: 6 }).map((_, index) => (
             <div
               key={index}
@@ -242,6 +257,9 @@ export function RepoInsightsDashboard() {
 
       {data ? (
         <div className="mt-6 space-y-6">
+          <p role="status" className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-muted">
+            Report for {data.repo.fullName}. Sample: {data.sampling.commits} latest default-branch commits{data.sampling.commitsTruncated ? " (older commits omitted)" : ""}, {data.sampling.issues} issues from the latest 30 issue/PR records, and {data.sampling.pullRequests} PRs. Activity counts below are sample counts, not repository totals. GitHub data may be cached for 15 minutes.
+          </p>
           <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-6">
             <MetricCard
               label="Stars"
@@ -269,7 +287,7 @@ export function RepoInsightsDashboard() {
               icon={<GitPullRequest className="h-5 w-5" />}
             />
             <MetricCard
-              label="Active Contributors"
+              label="Contributors Shown"
               value={formatCompactNumber(data.derived.contributorCount)}
               icon={<Users className="h-5 w-5" />}
             />
@@ -278,7 +296,7 @@ export function RepoInsightsDashboard() {
           <section className="grid gap-6 lg:grid-cols-[1.25fr_0.75fr]">
             <div className="glass-card-strong rounded-[32px] p-6">
               <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
-                <div className="flex items-start gap-4">
+                <div className="flex min-w-0 items-start gap-4">
                   <Image
                     src={data.repo.owner.avatarUrl}
                     alt={`${data.repo.owner.login} avatar`}
@@ -290,7 +308,7 @@ export function RepoInsightsDashboard() {
                     <p className="text-sm font-medium uppercase tracking-[0.24em] text-[var(--accent)]">
                       Repository Overview
                     </p>
-                    <h2 className="mt-2 text-3xl font-semibold text-slate-950">
+                    <h2 className="mt-2 break-all text-3xl font-semibold text-slate-950">
                       {data.repo.fullName}
                     </h2>
                     <p className="mt-3 max-w-2xl text-sm leading-6 text-muted">
@@ -311,7 +329,7 @@ export function RepoInsightsDashboard() {
 
               <div className="mt-8 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                 <div className="rounded-3xl bg-slate-950 px-5 py-4 text-white">
-                  <p className="text-xs uppercase tracking-[0.22em] text-white/65">Health Signal</p>
+                  <p className="text-xs uppercase tracking-[0.22em] text-white/65">Sample Activity Score</p>
                   <p className="mt-2 text-3xl font-semibold">{data.health.score}/100</p>
                   <p className="mt-2 text-sm text-white/75">{data.health.label}</p>
                 </div>
@@ -347,14 +365,14 @@ export function RepoInsightsDashboard() {
             </div>
 
             <SectionCard
-              title="Health Heuristic"
-              subtitle="A lightweight interview-friendly score built from activity, contributor breadth, and delivery signals."
+              title="Activity Score"
+              subtitle="A transparent summary of sampled activity; not a quality or security assessment."
             >
               <div className="space-y-4">
                 <div className="flex items-center gap-3 rounded-3xl bg-[var(--accent-soft)] px-4 py-4 text-slate-900">
                   <Scale className="h-5 w-5 text-[var(--accent-strong)]" />
                   <div>
-                    <p className="text-sm font-semibold">{data.health.label} repo health</p>
+                    <p className="text-sm font-semibold">{data.health.label}</p>
                     <p className="text-sm text-slate-700">{data.health.score} out of 100 heuristic score</p>
                   </div>
                 </div>
@@ -377,7 +395,7 @@ export function RepoInsightsDashboard() {
           <section className="grid gap-6 xl:grid-cols-[1.2fr_0.8fr]">
             <SectionCard
               title="Commit Activity"
-              subtitle="Recent weekly commit volume helps recruiters see whether a project is actively moving."
+              subtitle="Sampled commits across twelve calendar weeks in UTC, including inactive weeks."
             >
               <div className="h-80">
                 <ResponsiveContainer width="100%" height="100%">
@@ -405,12 +423,21 @@ export function RepoInsightsDashboard() {
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
+              <details className="mt-4 text-sm text-muted">
+                <summary className="cursor-pointer">View weekly commit values</summary>
+                <table className="mt-3 w-full text-left">
+                  <caption className="sr-only">Sampled default-branch commits by UTC week</caption>
+                  <thead><tr><th scope="col">Week starting (UTC)</th><th scope="col">Commits</th></tr></thead>
+                  <tbody>{data.commitActivity.map(week => <tr key={week.weekStart}><th scope="row" className="font-normal">{week.weekStart.slice(0, 10)}</th><td>{week.commits}</td></tr>)}</tbody>
+                </table>
+              </details>
             </SectionCard>
 
             <SectionCard
               title="Language Mix"
               subtitle="Byte-based breakdown from the GitHub languages endpoint."
             >
+              {!data.languageBreakdown.length ? <p className="text-sm text-muted">GitHub has not reported languages for this repository.</p> : null}
               <div className="grid gap-4 md:grid-cols-[0.9fr_1.1fr] md:items-center">
                 <div className="h-60">
                   <ResponsiveContainer width="100%" height="100%">
@@ -432,7 +459,7 @@ export function RepoInsightsDashboard() {
                   </ResponsiveContainer>
                 </div>
                 <div className="space-y-3">
-                  {data.languageBreakdown.slice(0, 6).map((language, index) => (
+                  {data.languageBreakdown.map((language, index) => (
                     <div key={language.name} className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
                       <div className="flex items-center justify-between gap-3">
                         <div className="flex items-center gap-3">
@@ -469,10 +496,10 @@ export function RepoInsightsDashboard() {
                 <div className="rounded-3xl border border-slate-200 bg-white px-5 py-4">
                   <p className="text-xs uppercase tracking-[0.22em] text-slate-500">30-Day Collaboration</p>
                   <p className="mt-2 text-xl font-semibold text-slate-900">
-                    {formatCompactNumber(data.derived.issuePullRequestVelocity)} tracked updates
+                    {formatCompactNumber(data.derived.issuePullRequestVelocity)} sampled work items
                   </p>
                   <p className="mt-2 text-sm text-muted">
-                    {data.collaboration.issuesUpdatedLast30Days} issue updates, {data.collaboration.pullRequestsUpdatedLast30Days} PR updates
+                    {data.collaboration.issuesUpdatedLast30Days} issues and {data.collaboration.pullRequestsUpdatedLast30Days} PRs updated within 30 days
                   </p>
                 </div>
                 <div className="rounded-3xl border border-slate-200 bg-white px-5 py-4">
@@ -485,12 +512,12 @@ export function RepoInsightsDashboard() {
                   </p>
                 </div>
                 <div className="rounded-3xl border border-slate-200 bg-white px-5 py-4">
-                  <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Issue Resolution Rate</p>
+                  <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Sample Closure Ratio</p>
                   <p className="mt-2 text-xl font-semibold text-slate-900">
                     {formatPercent(data.collaboration.issueResolutionRate)}
                   </p>
                   <p className="mt-2 text-sm text-muted">
-                    Based on recently opened versus recently closed issues in the sampled window
+                    Issues closed / opened within 30 days in this sample. Can exceed 1; not a resolution percentage.
                   </p>
                 </div>
               </div>
@@ -516,7 +543,7 @@ export function RepoInsightsDashboard() {
 
             <SectionCard
               title="Recent Discussions"
-              subtitle="This feed highlights the work items a recruiter or reviewer would likely inspect next."
+              subtitle="Most recently updated work items returned by GitHub."
             >
               <div className="grid gap-4 md:grid-cols-2">
                 <div>
@@ -525,6 +552,7 @@ export function RepoInsightsDashboard() {
                     Recent issues
                   </p>
                   <div className="space-y-3">
+                    {!data.collaboration.recentIssues.length ? <p className="text-sm text-muted">No issues returned in the recent sample.</p> : null}
                     {data.collaboration.recentIssues.map((issue) => (
                       <a
                         key={issue.number}
@@ -549,6 +577,7 @@ export function RepoInsightsDashboard() {
                     Recent pull requests
                   </p>
                   <div className="space-y-3">
+                    {!data.collaboration.recentPullRequests.length ? <p className="text-sm text-muted">No pull requests returned.</p> : null}
                     {data.collaboration.recentPullRequests.map((pullRequest) => (
                       <a
                         key={pullRequest.number}
@@ -577,6 +606,7 @@ export function RepoInsightsDashboard() {
               subtitle="A small contributor summary makes collaboration scale visible right away."
             >
               <div className="space-y-3">
+                {!data.contributors.length ? <p className="text-sm text-muted">No contributor records available.</p> : null}
                 {data.contributors.map((contributor, index) => (
                   <a
                     key={contributor.login}
@@ -598,7 +628,7 @@ export function RepoInsightsDashboard() {
                       />
                       <div>
                         <p className="font-medium text-slate-900">{contributor.login}</p>
-                        <p className="text-sm text-muted">{contributor.contributions} recent contributions</p>
+                        <p className="text-sm text-muted">{contributor.contributions} default-branch commits (all time)</p>
                       </div>
                     </div>
                     <ArrowUpRight className="h-4 w-4 text-slate-500" />
@@ -612,6 +642,7 @@ export function RepoInsightsDashboard() {
               subtitle="Public GitHub events add a qualitative feed on top of the quantitative charts."
             >
               <div className="space-y-3">
+                {!data.recentActivity.length ? <p className="text-sm text-muted">No recent public events available.</p> : null}
                 {data.recentActivity.map((event) => (
                   <div key={event.id} className="rounded-3xl border border-slate-200 bg-white px-4 py-4">
                     <div className="flex items-start justify-between gap-3">
@@ -638,25 +669,25 @@ export function RepoInsightsDashboard() {
                 <h3 className="text-base font-semibold text-slate-900">Why this metric matters</h3>
               </div>
               <p className="text-sm leading-6 text-muted">
-                Commit frequency tells a stronger story than raw star count because it shows whether a project is still being worked on.
+                Commit frequency shows observed development activity. A quiet repository can still be useful and well maintained; interpret these samples in context.
               </p>
             </div>
             <div className="glass-card rounded-[24px] p-5">
               <div className="mb-3 flex items-center gap-3">
                 <Flame className="h-5 w-5 text-[var(--accent)]" />
-                <h3 className="text-base font-semibold text-slate-900">Pre-deployment improvement</h3>
+                <h3 className="text-base font-semibold text-slate-900">Sampling limits</h3>
               </div>
               <p className="text-sm leading-6 text-muted">
-                The app now measures work intake and review flow, so the dashboard speaks to engineering process rather than only repository popularity.
+                Busy repositories can have more activity than the report samples. Merge times describe only PRs merged within 30 days in the returned sample.
               </p>
             </div>
             <div className="glass-card rounded-[24px] p-5">
               <div className="mb-3 flex items-center gap-3">
                 <GitBranch className="h-5 w-5 text-[var(--accent)]" />
-                <h3 className="text-base font-semibold text-slate-900">Future-ready extension path</h3>
+                <h3 className="text-base font-semibold text-slate-900">Public data</h3>
               </div>
               <p className="text-sm leading-6 text-muted">
-                You can add authenticated rate-limit upgrades, repo comparison, cached reports, or deployments later without reworking the core API contract.
+                Reports use public GitHub data. No sign-in is required, and this app does not store searches in a database.
               </p>
             </div>
           </section>

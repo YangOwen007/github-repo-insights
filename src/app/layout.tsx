@@ -5,7 +5,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "GitHub Repo Insights",
   description:
-    "Analyze public GitHub repositories through a polished dashboard of activity, composition, and health signals.",
+    "Explore public GitHub repository languages, contributors, and sampled commit, issue, and pull request activity.",
 };
 
 // This root layout wraps every page so shared styling and metadata only need to be defined once.

@@ -7,9 +7,19 @@ import {
   githubRepoSchema,
   repoQuerySchema,
   type RepoInsightResponse,
-} from "@/lib/schemas";
+} from "./schemas.ts";
+import { z } from "zod";
 
 const GITHUB_API_BASE = "https://api.github.com";
+
+// Typed failures let the route distinguish user mistakes from upstream outages.
+export class InsightsError extends Error {
+  public status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
 
 type GitHubHeaders = {
   remaining: number | null;
@@ -19,52 +29,56 @@ type GitHubHeaders = {
 
 // This helper normalizes either "owner/repo" input or a pasted GitHub URL into one canonical format.
 export function normalizeRepoInput(rawRepo: string) {
-  const parsed = repoQuerySchema.parse({ repo: rawRepo });
-  const value = parsed.repo.trim();
-
-  if (value.includes("github.com")) {
-    const url = new URL(value);
-    const segments = url.pathname.split("/").filter(Boolean);
-
-    if (segments.length < 2) {
-      throw new Error("GitHub URLs must include both an owner and repository name.");
-    }
-
-    return {
-      owner: segments[0],
-      repo: segments[1].replace(/\.git$/, ""),
-      fullName: `${segments[0]}/${segments[1].replace(/\.git$/, "")}`,
-    };
+  const parsed = repoQuerySchema.safeParse({ repo: rawRepo });
+  const invalid = () => new InsightsError("Use owner/repo or https://github.com/owner/repo.", 400);
+  if (!parsed.success) throw invalid();
+  let value = parsed.data.repo;
+  if (value.includes(":")) {
+    let url: URL;
+    try { url = new URL(value); } catch { throw invalid(); }
+    if (url.protocol !== "https:" || url.hostname !== "github.com" || url.port || url.username || url.password || url.search || url.hash) throw invalid();
+    value = url.pathname.replace(/^\//, "").replace(/\/$/, "");
   }
-
-  const [owner, repo] = value.split("/");
-
-  if (!owner || !repo) {
-    throw new Error("Use the format owner/repo, like vercel/next.js.");
-  }
-
-  return {
-    owner,
-    repo: repo.replace(/\.git$/, ""),
-    fullName: `${owner}/${repo.replace(/\.git$/, "")}`,
-  };
+  const segments = value.split("/");
+  if (segments.length !== 2) throw invalid();
+  const [owner, rawName] = segments;
+  const repo = rawName.replace(/\.git$/, "");
+  if (!/^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$/.test(owner) || !/^[a-zA-Z0-9_.-]{1,100}$/.test(repo) || repo === "." || repo === "..") throw invalid();
+  return { owner, repo, fullName: `${owner}/${repo}` };
 }
 
 // This helper builds a GitHub request with the headers needed for JSON responses and optional auth later.
 async function fetchGitHubJson<T>(
   path: string,
-  init?: RequestInit,
+  emptyStatus?: number,
 ): Promise<{ data: T; headers: GitHubHeaders }> {
   const token = process.env.GITHUB_TOKEN;
-  const response = await fetch(`${GITHUB_API_BASE}${path}`, {
-    ...init,
-    headers: {
-      Accept: "application/vnd.github+json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...init?.headers,
-    },
-    next: { revalidate: 900 },
-  });
+  let response: Response;
+  try {
+    let url = new URL(path, GITHUB_API_BASE);
+    const signal = AbortSignal.timeout(12000);
+    // Moved repositories redirect inside GitHub. Never forward credentials to another origin.
+    for (let redirects = 0; ; redirects++) {
+      response = await fetch(url.href, {
+        signal,
+        redirect: "manual",
+        headers: {
+          Accept: "application/vnd.github+json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+        next: { revalidate: 900 },
+      });
+      if (![301, 302, 307, 308].includes(response.status)) break;
+      const location = response.headers.get("location");
+      if (!location || redirects >= 3) throw new Error("Invalid redirect");
+      const nextUrl = new URL(location, url);
+      if (nextUrl.origin !== GITHUB_API_BASE || nextUrl.username || nextUrl.password) throw new Error("Invalid redirect");
+      url = nextUrl;
+    }
+  } catch {
+    throw new InsightsError("GitHub could not be reached. Please try again shortly.", 503);
+  }
 
   const headers = {
     remaining: response.headers.get("x-ratelimit-remaining")
@@ -77,15 +91,17 @@ async function fetchGitHubJson<T>(
   };
 
   if (response.status === 404) {
-    throw new Error("Repository not found. Check the owner and repo name.");
+    throw new InsightsError("Public repository not found. Check the owner and repo name.", 404);
   }
 
-  if (response.status === 403 && headers.remaining === 0) {
-    throw new Error("GitHub API rate limit reached. Try again later or add a token.");
+  if (response.status === 429 || (response.status === 403 && (headers.remaining === 0 || response.headers.has("retry-after")))) {
+    throw new InsightsError("GitHub API rate limit reached. Please try again later.", 429);
   }
+
+  if (response.status === 204 || response.status === emptyStatus) return { data: [] as T, headers };
 
   if (!response.ok) {
-    throw new Error(`GitHub request failed with status ${response.status}.`);
+    throw new InsightsError("GitHub could not provide repository data. Please try again later.", 502);
   }
 
   return {
@@ -95,21 +111,14 @@ async function fetchGitHubJson<T>(
 }
 
 // This helper reads GitHub pagination metadata so we can estimate counts without downloading every page.
-function getPaginatedCount(linkHeader: string | null, fallbackCount: number) {
+export function getPaginatedCount(linkHeader: string | null, fallbackCount: number) {
   if (!linkHeader) {
     return fallbackCount;
   }
 
-  const lastMatch = linkHeader.match(/[?&]page=(\d+)>; rel="last"/);
-
-  if (lastMatch) {
-    return Number(lastMatch[1]);
-  }
-
-  const nextMatch = linkHeader.match(/[?&]page=(\d+)>; rel="next"/);
-
-  if (nextMatch) {
-    return Number(nextMatch[1]);
+  for (const part of linkHeader.split(",")) {
+    const match = part.match(/<([^>]+)>;\s*rel="last"/);
+    if (match) return Number(new URL(match[1]).searchParams.get("page")) || fallbackCount;
   }
 
   return fallbackCount;
@@ -133,18 +142,26 @@ function buildLanguageBreakdown(languageMap: Record<string, number>) {
 }
 
 // This helper buckets recent commits by week so the chart highlights momentum rather than noisy daily spikes.
-function buildCommitActivity(commits: Array<{ commit: { author: { date: string } } }>) {
+export function buildCommitActivity(commits: Array<{ commit: { committer: { date: string } } }>, now = new Date()) {
   const weekCounts = new Map<string, number>();
+  // Include all twelve calendar weeks so gaps reset streaks and count in averages.
+  const currentMonday = new Date(now);
+  currentMonday.setUTCDate(now.getUTCDate() - (now.getUTCDay() + 6) % 7);
+  currentMonday.setUTCHours(0, 0, 0, 0);
+  for (let offset = 11; offset >= 0; offset--) {
+    weekCounts.set(new Date(currentMonday.getTime() - offset * 7 * 86400000).toISOString(), 0);
+  }
 
   for (const item of commits) {
-    const date = new Date(item.commit.author.date);
+    const date = new Date(item.commit.committer.date);
+    if (!Number.isFinite(date.getTime()) || date > now) continue;
     const dayOffset = (date.getUTCDay() + 6) % 7;
     const weekStart = new Date(date);
     weekStart.setUTCDate(date.getUTCDate() - dayOffset);
     weekStart.setUTCHours(0, 0, 0, 0);
 
     const key = weekStart.toISOString();
-    weekCounts.set(key, (weekCounts.get(key) ?? 0) + 1);
+    if (weekCounts.has(key)) weekCounts.set(key, (weekCounts.get(key) ?? 0) + 1);
   }
 
   return Array.from(weekCounts.entries())
@@ -185,104 +202,28 @@ function summarizeEvent(event: {
   }
 }
 
-// This helper derives a lightweight health score that is simple to explain in interviews.
+// This activity score is descriptive, not a prediction of quality or maintenance.
 function buildHealthSummary(input: {
   archived: boolean;
   commitsLast90Days: number;
-  contributorCount: number;
-  openIssues: number;
-  openPullRequests: number;
   mergedPullRequestsLast30Days: number;
-  issueResolutionRate: number | null;
-  stars: number;
 }) {
-  const reasons: string[] = [];
-  let score = 45;
-
-  if (input.archived) {
-    score -= 25;
-    reasons.push("Archived repositories are harder to treat as actively maintained.");
-  } else {
-    score += 10;
-    reasons.push("The repository is still active rather than archived.");
-  }
-
-  if (input.commitsLast90Days >= 20) {
-    score += 18;
-    reasons.push("Recent commit volume suggests steady development momentum.");
-  } else if (input.commitsLast90Days >= 5) {
-    score += 10;
-    reasons.push("The repository shows some recent development activity.");
-  } else {
-    score -= 8;
-    reasons.push("Low recent commit activity may indicate slower maintenance.");
-  }
-
-  if (input.contributorCount >= 5) {
-    score += 12;
-    reasons.push("Multiple contributors reduce project bus-factor risk.");
-  } else if (input.contributorCount >= 2) {
-    score += 6;
-    reasons.push("There is more than one active contributor.");
-  } else {
-    reasons.push("A single core contributor can make the project fragile.");
-  }
-
-  if (input.openIssues <= 25) {
-    score += 8;
-    reasons.push("Open issue volume looks manageable for an MVP health heuristic.");
-  } else if (input.openIssues >= 200) {
-    score -= 6;
-    reasons.push("A large open issue backlog can be a maintenance warning sign.");
-  }
-
-  if (input.mergedPullRequestsLast30Days >= 10) {
-    score += 10;
-    reasons.push("Recent pull request merges suggest maintainers are actively shipping changes.");
-  } else if (input.mergedPullRequestsLast30Days === 0) {
-    score -= 6;
-    reasons.push("No recent merged pull requests can indicate slower review and delivery loops.");
-  }
-
-  if (input.issueResolutionRate !== null) {
-    if (input.issueResolutionRate >= 0.6) {
-      score += 8;
-      reasons.push("Recent issue resolution looks healthy relative to newly observed issues.");
-    } else if (input.issueResolutionRate < 0.25) {
-      score -= 5;
-      reasons.push("Issues appear to be closing slower than they are opening in the recent sample.");
-    }
-  }
-
-  if (input.openPullRequests >= 50) {
-    score -= 4;
-    reasons.push("A large open pull request queue may signal review bottlenecks.");
-  }
-
-  if (input.stars >= 500) {
-    score += 7;
-    reasons.push("Strong community interest can be a positive trust signal.");
-  }
-
-  const boundedScore = Math.max(0, Math.min(100, score));
-  const label =
-    boundedScore >= 80
-      ? "Strong"
-      : boundedScore >= 60
-        ? "Healthy"
-        : boundedScore >= 40
-          ? "Mixed"
-          : "Needs Review";
-
+  const commitPoints = Math.min(60, input.commitsLast90Days * 3);
+  const mergePoints = Math.min(40, input.mergedPullRequestsLast30Days * 4);
   return {
-    score: boundedScore,
-    label,
-    reasons,
+    score: input.archived ? 0 : commitPoints + mergePoints,
+    label: input.archived ? "Archived" : "Sample activity",
+    reasons: [
+      `Commit sample: ${commitPoints}/60 points (3 per commit within 90 days, capped at 60).`,
+      `PR sample: ${mergePoints}/40 points (4 per merge within 30 days, capped at 40).`,
+      "Archived repositories score zero. Stars, backlog size, and contributor count do not affect this score.",
+      "Samples can undercount activity. This is not a measure of quality, security, or maintainer responsiveness.",
+    ],
   };
 }
 
 // This helper computes a simple weekly streak metric that rewards consistent output over raw volume.
-function getLongestWeeklyStreak(commitActivity: RepoInsightResponse["commitActivity"]) {
+export function getLongestWeeklyStreak(commitActivity: RepoInsightResponse["commitActivity"]) {
   let longest = 0;
   let current = 0;
 
@@ -342,7 +283,7 @@ function getAverageMergeHours(pullRequests: Array<{ created_at: string; merged_a
 }
 
 // This helper compares recently opened and recently closed issues so the health heuristic can reason about throughput.
-function getIssueResolutionRate(issues: Array<{ created_at: string; closed_at: string | null }>) {
+export function getIssueResolutionRate(issues: Array<{ created_at: string; closed_at: string | null }>) {
   const now = Date.now();
   const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
   const recentlyOpened = issues.filter((issue) => now - new Date(issue.created_at).getTime() <= thirtyDaysMs).length;
@@ -351,7 +292,7 @@ function getIssueResolutionRate(issues: Array<{ created_at: string; closed_at: s
   ).length;
 
   if (!recentlyOpened) {
-    return recentlyClosed ? 1 : null;
+    return null;
   }
 
   return Number((recentlyClosed / recentlyOpened).toFixed(2));
@@ -359,14 +300,18 @@ function getIssueResolutionRate(issues: Array<{ created_at: string; closed_at: s
 
 // This main function fetches public GitHub data, validates it, and transforms it into dashboard-ready insight objects.
 export async function getRepoInsights(rawRepo: string): Promise<RepoInsightResponse> {
-  const normalized = normalizeRepoInput(rawRepo);
+  let normalized = normalizeRepoInput(rawRepo);
+  // Verify visibility before fetching any detail with a potentially privileged token.
+  const repoResult = await fetchGitHubJson(`/repos/${normalized.owner}/${normalized.repo}`);
+  const repo = githubRepoSchema.parse(repoResult.data);
+  if (repo.private || repo.visibility !== "public") throw new InsightsError("Public repository not found. Check the owner and repo name.", 404);
+  normalized = normalizeRepoInput(repo.full_name);
 
-  const [repoResult, languageResult, contributorResult, commitResult, eventResult, issueResult, pullRequestResult, openPullRequestCountResult] =
+  const [languageResult, contributorResult, commitResult, eventResult, issueResult, pullRequestResult, openPullRequestCountResult] =
     await Promise.all([
-      fetchGitHubJson(`/repos/${normalized.owner}/${normalized.repo}`),
       fetchGitHubJson<Record<string, number>>(`/repos/${normalized.owner}/${normalized.repo}/languages`),
       fetchGitHubJson(`/repos/${normalized.owner}/${normalized.repo}/contributors?per_page=5`),
-      fetchGitHubJson(`/repos/${normalized.owner}/${normalized.repo}/commits?per_page=100`),
+      fetchGitHubJson(`/repos/${normalized.owner}/${normalized.repo}/commits?per_page=100`, 409),
       fetchGitHubJson(`/repos/${normalized.owner}/${normalized.repo}/events?per_page=12`),
       fetchGitHubJson(
         `/repos/${normalized.owner}/${normalized.repo}/issues?state=all&sort=updated&direction=desc&per_page=30`,
@@ -379,25 +324,26 @@ export async function getRepoInsights(rawRepo: string): Promise<RepoInsightRespo
       ),
     ]);
 
-  const repo = githubRepoSchema.parse(repoResult.data);
   const contributors = githubContributorSchema.array().parse(contributorResult.data);
   const commits = githubCommitSchema.array().parse(commitResult.data);
   const events = githubEventSchema.array().parse(eventResult.data);
   const issues = githubIssueSchema.array().parse(issueResult.data).filter((issue) => !issue.pull_request);
   const pullRequests = githubPullRequestSchema.array().parse(pullRequestResult.data);
 
-  const languageBreakdown = buildLanguageBreakdown(languageResult.data);
+  const languageBreakdown = buildLanguageBreakdown(z.record(z.string(), z.number().nonnegative()).parse(languageResult.data));
   const commitActivity = buildCommitActivity(commits);
   const openPullRequests = getPaginatedCount(
     openPullRequestCountResult.headers.link,
-    pullRequests.length ? 1 : 0,
+    z.array(z.unknown()).parse(openPullRequestCountResult.data).length,
   );
   const openIssues = Math.max(0, repo.open_issues_count - openPullRequests);
   const commitsLast30Days = commits.filter((item) => {
-    return Date.now() - new Date(item.commit.author.date).getTime() <= 30 * 24 * 60 * 60 * 1000;
+    const age = Date.now() - new Date(item.commit.committer.date).getTime();
+    return age >= 0 && age <= 30 * 86400000;
   }).length;
   const commitsLast90Days = commits.filter((item) => {
-    return Date.now() - new Date(item.commit.author.date).getTime() <= 90 * 24 * 60 * 60 * 1000;
+    const age = Date.now() - new Date(item.commit.committer.date).getTime();
+    return age >= 0 && age <= 90 * 86400000;
   }).length;
   const averageCommitsPerWeek = commitActivity.length
     ? Number(
@@ -418,21 +364,17 @@ export async function getRepoInsights(rawRepo: string): Promise<RepoInsightRespo
       Date.now() - new Date(pullRequest.merged_at).getTime() <= 30 * 24 * 60 * 60 * 1000
     );
   }).length;
-  const averagePullRequestMergeHours = getAverageMergeHours(pullRequests);
+  const averagePullRequestMergeHours = getAverageMergeHours(pullRequests.filter(pr => pr.merged_at && Date.now() - new Date(pr.merged_at).getTime() <= 30 * 86400000));
   const issueResolutionRate = getIssueResolutionRate(issues);
 
   const health = buildHealthSummary({
     archived: repo.archived,
     commitsLast90Days,
-    contributorCount: contributors.length,
-    openIssues,
-    openPullRequests,
     mergedPullRequestsLast30Days,
-    issueResolutionRate,
-    stars: repo.stargazers_count,
   });
 
   return {
+    sampling: { commits: commits.length, commitsTruncated: !!commitResult.headers.link?.includes('rel="next"'), issues: issues.length, pullRequests: pullRequests.length, fetchedAt: new Date().toISOString() },
     repo: {
       name: repo.name,
       fullName: repo.full_name,
@@ -486,7 +428,7 @@ export async function getRepoInsights(rawRepo: string): Promise<RepoInsightRespo
         url: issue.html_url,
         state: issue.state,
         updatedAt: issue.updated_at,
-        author: issue.user.login,
+        author: issue.user?.login ?? "Deleted account",
       })),
       recentPullRequests: pullRequests.slice(0, 5).map((pullRequest) => ({
         number: pullRequest.number,
@@ -494,7 +436,7 @@ export async function getRepoInsights(rawRepo: string): Promise<RepoInsightRespo
         url: pullRequest.html_url,
         state: pullRequest.state,
         updatedAt: pullRequest.updated_at,
-        author: pullRequest.user.login,
+        author: pullRequest.user?.login ?? "Deleted account",
         mergedAt: pullRequest.merged_at,
       })),
     },

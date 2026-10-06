@@ -58,3 +58,14 @@ body {
 .text-muted {
   color: var(--muted);
 }
+
+/* Keyboard users need a visible focus indicator on links and buttons, too. */
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

@@ -9,7 +9,14 @@ out
 # Local environment files
 .env
 .env.local
-.env.*.local
+.env.*
+!.env.example
+.agents/
+.codex/
+*.log
+coverage/
+test-results/
+.verification/
 
 # Logs
 pnpm-debug.log*

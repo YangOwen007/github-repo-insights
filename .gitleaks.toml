@@ -1,0 +1,13 @@
+[extend]
+useDefault = true
+
+# Local dependency and verification copies are not application source.
+# Build output remains in scope; the historical token example is an exact placeholder.
+[[allowlists]]
+paths = ['''(^|[\\/])(node_modules|\.pnpm-store|\.verification|\.agents|\.codex)[\\/]''']
+regexes = ['''^your_personal_access_token$''']
+
+# Next.js generates private preview/action encryption keys in these ignored server files.
+# Browser bundles and other build files remain scanned. Do not publish .next server artifacts as static files.
+[[allowlists]]
+paths = ['''^\.next[/\\]cache[/\\]\.(rscinfo|previewinfo)$''', '''^\.next[/\\]prerender-manifest\.json$''', '''^\.next[/\\]server[/\\]server-reference-manifest\.json$''']

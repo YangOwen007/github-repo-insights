@@ -5,6 +5,7 @@ export const repoQuerySchema = z.object({
   repo: z
     .string()
     .trim()
+    .max(300, "Repository input is too long.")
     .min(3, "Enter a repository in the format owner/repo or a GitHub URL."),
 });
 
@@ -17,7 +18,7 @@ export const githubRepoSchema = z.object({
   html_url: z.string().url(),
   stargazers_count: z.number(),
   forks_count: z.number(),
-  subscribers_count: z.number().optional().default(0),
+  subscribers_count: z.number().optional(),
   open_issues_count: z.number(),
   watchers_count: z.number(),
   language: z.string().nullable(),
@@ -29,6 +30,7 @@ export const githubRepoSchema = z.object({
   archived: z.boolean(),
   forks: z.number(),
   visibility: z.string(),
+  private: z.boolean(),
   owner: z.object({
     login: z.string(),
     avatar_url: z.string().url(),
@@ -52,7 +54,8 @@ export const githubCommitSchema = z.object({
     author: z.object({
       name: z.string(),
       date: z.string(),
-    }),
+    }).nullable(),
+    committer: z.object({ date: z.string() }),
   }),
   author: z
     .object({
@@ -90,7 +93,7 @@ export const githubIssueSchema = z.object({
   comments: z.number(),
   user: z.object({
     login: z.string(),
-  }),
+  }).nullable(),
   labels: z.array(
     z.object({
       id: z.number(),
@@ -115,19 +118,21 @@ export const githubPullRequestSchema = z.object({
   updated_at: z.string(),
   closed_at: z.string().nullable(),
   merged_at: z.string().nullable(),
-  comments: z.number(),
-  review_comments: z.number(),
-  commits: z.number(),
-  additions: z.number().optional(),
-  deletions: z.number().optional(),
-  changed_files: z.number().optional(),
+  // The list endpoint omits detail-only counts such as commits and review_comments.
   user: z.object({
     login: z.string(),
-  }),
+  }).nullable(),
 });
 
 // These schemas describe the app's own API contract so the frontend and backend stay aligned.
 export const repoInsightResponseSchema = z.object({
+  sampling: z.object({
+    commits: z.number(),
+    commitsTruncated: z.boolean(),
+    issues: z.number(),
+    pullRequests: z.number(),
+    fetchedAt: z.string(),
+  }),
   repo: z.object({
     name: z.string(),
     fullName: z.string(),
